@@ -1168,9 +1168,18 @@ stats_server_to_metric(struct context *ctx, struct server *server,
     pidx = server->owner->idx;
 
     st = ctx->stats;
-    stp = array_get(&st->current, pidx);
-    sts = array_get(&stp->server, sidx);
-    stm = array_get(&sts->metric, fidx);
+    if (pidx < array_n(&st->current))
+        stp = array_get(&st->current, pidx);
+    else
+        return NULL;
+    if (sidx < array_n(&stp->server))
+        sts = array_get(&stp->server, sidx);
+    else
+        return NULL;
+    if (fidx < array_n(&sts->metric))
+        stm = array_get(&sts->metric, fidx);
+    else
+        return NULL;
 
     st->updated = 1;
 
@@ -1187,6 +1196,8 @@ _stats_server_incr(struct context *ctx, struct server *server,
     struct stats_metric *stm;
 
     stm = stats_server_to_metric(ctx, server, fidx);
+    if (stm == NULL)
+        return;
 
     ASSERT(stm->type == STATS_COUNTER || stm->type == STATS_GAUGE);
     stm->value.counter++;
@@ -1202,6 +1213,8 @@ _stats_server_decr(struct context *ctx, struct server *server,
     struct stats_metric *stm;
 
     stm = stats_server_to_metric(ctx, server, fidx);
+    if (stm == NULL)
+        return;
 
     ASSERT(stm->type == STATS_GAUGE);
     stm->value.counter--;
@@ -1217,6 +1230,8 @@ _stats_server_incr_by(struct context *ctx, struct server *server,
     struct stats_metric *stm;
 
     stm = stats_server_to_metric(ctx, server, fidx);
+    if (stm == NULL)
+        return;
 
     ASSERT(stm->type == STATS_COUNTER || stm->type == STATS_GAUGE);
     stm->value.counter += val;
@@ -1232,6 +1247,8 @@ _stats_server_decr_by(struct context *ctx, struct server *server,
     struct stats_metric *stm;
 
     stm = stats_server_to_metric(ctx, server, fidx);
+    if (stm)
+        return;
 
     ASSERT(stm->type == STATS_GAUGE);
     stm->value.counter -= val;
@@ -1247,6 +1264,8 @@ _stats_server_set_ts(struct context *ctx, struct server *server,
     struct stats_metric *stm;
 
     stm = stats_server_to_metric(ctx, server, fidx);
+    if (stm ==NULL)
+        return;
 
     ASSERT(stm->type == STATS_TIMESTAMP);
     stm->value.timestamp = val;

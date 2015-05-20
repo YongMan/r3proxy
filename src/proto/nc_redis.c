@@ -1705,6 +1705,7 @@ redis_parse_rsp(struct msg *r)
         SW_RUNTO_CRLF,
         SW_ALMOST_DONE,
         SW_SLOT_NUM,
+        SW_SLOT_ADDR_START,
         SW_SLOT_ADDR,
         SW_SENTINEL
     } state;
@@ -1727,6 +1728,18 @@ redis_parse_rsp(struct msg *r)
         switch (state) {
         case SW_START:
             r->type = MSG_UNKNOWN;
+
+            if (ch == '-') {
+                if (r->token == NULL) {
+                    r->token = p;
+                }
+                /* 7 == max('-MOVED ', '-ASK ') */
+                if (r->token + 7 >= b->last) {
+                    p = b->last - 1;
+                    break;
+                }
+            }
+
             switch (ch) {
             case '+':
                 p = p - 1; /* go back by 1 byte */
@@ -1737,10 +1750,12 @@ redis_parse_rsp(struct msg *r)
             case '-':
                 if (str5icmp((p+1), 'M', 'O', 'V', 'E', 'D')) {
                     r->type = MSG_RSP_REDIS_MOVED;
+                    r->token = NULL;
                     p += 6;
                     state = SW_SLOT_NUM;
                 } else if (str3icmp((p+1), 'A', 'S', 'K')) {
                     r->type = MSG_RSP_REDIS_ASK;
+                    r->token = NULL;
                     p += 4;
                     state = SW_SLOT_NUM;
                 } else {
@@ -2049,14 +2064,16 @@ redis_parse_rsp(struct msg *r)
 
         case SW_SLOT_NUM:
             if (ch == ' ') {
-                state = SW_SLOT_ADDR;
-                p++;
-                r->val_start = p;
+                state = SW_SLOT_ADDR_START;
                 break;
             }
+            r->integer *= 10;
             r->integer += ch - '0';
-            if (p[1] != ' ')
-                r->integer *= 10;
+            break;
+
+        case SW_SLOT_ADDR_START:
+            r->val_start = p;
+            state = SW_SLOT_ADDR;
             break;
 
         case SW_SLOT_ADDR:
@@ -2840,7 +2857,7 @@ redis_routing(struct context *ctx, struct server_pool *pool,
 }
 
 static rstatus_t
-build_custom_message(struct msg *r, uint8_t *msgbody, size_t msglen, int swallow)
+build_custom_message(struct msg *r, uint8_t *msgbody, size_t msglen, int noreply)
 {
     struct mbuf *mbuf;
     size_t msize;
@@ -2860,7 +2877,7 @@ build_custom_message(struct msg *r, uint8_t *msgbody, size_t msglen, int swallow
     
     mbuf_copy(mbuf, msgbody, msglen);
     r->mlen += (uint32_t)msglen;
-    r->swallow = swallow;
+    r->noreply = noreply;
     
     return NC_OK;
 }
@@ -2914,6 +2931,14 @@ redis_pre_rsp_forward(struct context *ctx, struct conn * s_conn, struct msg *msg
         s_conn = server_conn(server);
         if (s_conn == NULL) goto ferror;
 
+        status = server_connect(pool->ctx, server, s_conn);
+        if (status != NC_OK) {
+            log_warn("redis: connect to server '%.*s' failed, ignored: %s",
+                     server->pname.len, server->pname.data, strerror(errno));
+            server_close(pool->ctx, s_conn);
+            goto ferror;
+        }
+
         /* need send ASKING firstly? */
         if (msg->type == MSG_RSP_REDIS_ASK) {
             struct msg *ask_msg;
@@ -2939,25 +2964,9 @@ redis_pre_rsp_forward(struct context *ctx, struct conn * s_conn, struct msg *msg
         /* resend the msg to the new server */
         status = req_enqueue(ctx, s_conn, c_conn, pmsg);
         if (status != NC_OK) {
-            log_debug(LOG_WARN, "redirect req %"PRIu64" len %"PRIu32" on s %d failed",
+            log_warn("redirect req %"PRIu64" len %"PRIu32" on s %d failed",
                       pmsg->id, pmsg->mlen, s_conn->sd);
             goto ferror;
-        }
-
-        /* need update slot? */
-        if (msg->type == MSG_RSP_REDIS_MOVED) {
-            uint8_t *key;
-            uint32_t keylen, idx;
-            struct keypos *kpos;
-
-            ASSERT(array_n(pmsg->keys) > 0);
-            kpos = array_get(pmsg->keys, 0);
-            key = kpos->start;
-            keylen = (uint32_t)(kpos->end - kpos->start);
-            idx = pool->key_hash((char*)key, keylen) % REDIS_CLUSTER_SLOTS;
-            if (msg->integer != idx) {
-                pool->slots[idx] = pool->slots[msg->integer];
-            }
         }
 
         msg_put(msg);
@@ -2965,7 +2974,7 @@ redis_pre_rsp_forward(struct context *ctx, struct conn * s_conn, struct msg *msg
 
 ferror:
         
-        log_debug(LOG_WARN, "server: failed to redirect message");
+        log_warn("server: failed to redirect message");
 
         msg_put(pmsg);
         msg_put(msg);
@@ -2974,21 +2983,51 @@ ferror:
 
     /* probe msg */
     if (c_conn == NULL) {
-        int64_t t_start, t_end;
         struct mbuf *mbuf;
 
         /* FIXME: check length */
         mbuf = STAILQ_FIRST(&msg->mhdr);
 
-        pool->mbuf_thread = mbuf;
+        pool->nprobebuf = mbuf->last - mbuf->start;
+        /* FIXME: buffer length */
+        if (pool->nprobebuf > REDIS_PROBE_BUF_SIZE) {
+            req_put(pmsg);
+            return NC_ERROR;
+        }
+        if (pool->probebuf_busy == 0) {
+            pool->probebuf_busy = 1;
+            memcpy(pool->probebuf, mbuf->start, pool->nprobebuf);
+        } else {
+            log_debug(LOG_VERB, "probe buffer is busy, ignore this probe message");
+        }
         req_put(pmsg);
 
         if (write(pool->notify_fd[1], "1", 1) != 1) {
-            log_debug(LOG_WARN, "write to pipe failed");
+            log_warn("write to pipe failed");
         }
         return NC_ERROR;
     }
 
+    return NC_OK;
+}
+
+static rstatus_t
+connect_to_server(struct server *server) {
+    struct server_pool *pool;
+    struct conn *conn;
+    rstatus_t status;
+
+    pool = server->owner;
+    conn = server_conn(server);
+    if (conn == NULL) {
+        return NC_ERROR;
+    }
+
+    status = server_connect(pool->ctx, server, conn);
+    if (status != NC_OK) {
+        server_close(pool->ctx, conn);
+        return NC_ERROR;
+    }
     return NC_OK;
 }
 
@@ -3011,7 +3050,8 @@ redis_pool_tick(struct server_pool *pool)
 
         pool->need_update_slots = 0;
 
-        msg = msg_get(NULL, true, 1);
+        log_debug(LOG_VERB, "do msg get in pool_tick");
+        msg = msg_get(NULL, true, true);
         if (msg == NULL) {
             return;
         }
@@ -3023,13 +3063,16 @@ redis_pool_tick(struct server_pool *pool)
             msg_put(msg);
             return;
         }
-        
-        idx = random() % 16384;
+
+        idx = random() % REDIS_CLUSTER_SLOTS;
+        server = NULL;
         if (pool->slots[idx] == NULL) {
             int s_cnt = array_n(&pool->server);
             int s_idx = s_cnt == 0 ? 0 : random() % array_n(&pool->server);
             server = *(struct server**)array_get(&pool->server, s_idx);
-            log_debug(LOG_VERB, "slot[%d] is nil, request server :%d", idx, server->port);
+            if (server) {
+                log_debug(LOG_VERB, "slot[%d] is nil, request server :%d", idx, server->port);
+            }
         } else {
             for (i = 0; i < NC_MAXTAGNUM; i++) {
                 uint32_t n;
@@ -3043,7 +3086,9 @@ redis_pool_tick(struct server_pool *pool)
                 server = *(struct server**)array_get(slaves, n);
                 break;
             }
-            log_debug(LOG_VERB, "slot[%d] is not nil, request server :%d", idx, server->port);
+            if (server) {
+                log_debug(LOG_VERB, "slot[%d] is not nil, request server :%d", idx, server->port);
+            }
         }
 
         if (server == NULL) {
@@ -3076,6 +3121,18 @@ redis_pool_tick(struct server_pool *pool)
     }
 
     if (pool->ffi_server_update) {
+        uint32_t i, n, m;
+        struct server **s, **se;
+        rstatus_t status;
+
+        struct context *ctx = pool->ctx;
+        struct stats *st = ctx->stats;
+        struct stats_pool stats_pool;
+        struct hash_table *server_idx_table;
+        uint8_t *hashkey;
+
+        pool->ffi_server_update = 0;
+
         log_debug(LOG_VERB, "lua update pool info done, apply  now");
 
         /* update servers */
@@ -3083,40 +3140,60 @@ redis_pool_tick(struct server_pool *pool)
             pool->ffi_server_update = 0;
             return;
         }
-        log_debug(LOG_VERB, "lua get %d servers", array_n(&pool->ffi_server));
+        log_debug(LOG_VVVERB, "lua get %d servers", array_n(&pool->ffi_server));
 
-        int n, m;
-        //clear server
         n = array_n(&pool->server);
         while (n--) {
-            array_pop(&pool->server);
+            s = array_get(&pool->server, n);
+            server_conn_close(ctx, *s);
         }
 
-        //pop ffi_server to server
+        stats_aggregate_force(st);
+
+        status = stats_pool_copy_init(&stats_pool, pool, &server_idx_table);
+        if (status != NC_OK) {
+            log_warn("stats_pool_copy_init failed");
+        }
+        status = stats_pool_copy(ctx, &stats_pool, &server_idx_table);
+
+        if (status != NC_OK) {
+            log_warn("stats_pool_copy failed");
+        }
+
+        pool->server.nelem = 0;
+
         n = array_n(&pool->ffi_server);
-        m = n;
-        struct server **s, **se;
         while (n--) {
             s = array_pop(&pool->ffi_server);
+            m = array_n(&pool->server);
             se = array_push(&pool->server);
             *se = *s;
-            (*s)->idx = m - n - 1;
+            (*s)->idx = m;
 
             /* add server to table */
-            char *hashkey = (*s)->hashkey;
-            log_debug(LOG_VVERB, "add server %s to hashtable", hashkey);
+            hashkey = (*s)->name.data;
+            log_debug(LOG_VERB, "add server:%s to hashtable", hashkey);
 
             if (assoc_set(pool->server_table, hashkey, strlen(hashkey), *s) != NC_OK) {
                 log_warn("add server %s to hashtable failed", hashkey);
             }
         }
-        log_debug(LOG_VVERB, "lua set %d servers", array_n(&pool->server));
 
-        struct context *ctx = pool->ctx;
-        struct stats *st = ctx->stats;
-        stats_reset(st, &ctx->pool);
+        status = stats_reset_and_recover(ctx, &stats_pool, &server_idx_table);
+        if (status != NC_OK) {
+            log_warn("reset and recover stats failed");
+        }
+        stats_pool_copy_deinit(&stats_pool, &server_idx_table);
 
-        pool->ffi_server_update = 0;
+        for (i = 0;i < array_n(&pool->server);i++) {
+            s = array_get(&pool->server, i);
+
+            /*connect to server, if need */
+            status = connect_to_server(*s);
+            if (status != NC_OK) {
+                continue;
+            }
+        }
     }
 
     if (pool->ffi_slots_update) {
